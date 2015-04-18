@@ -17,7 +17,7 @@ ifeq ($(TARGET_USES_QCOM_BSP),true)
 LOCAL_SHARED_LIBRARIES += libskia
 endif #TARGET_USES_QCOM_BSP
 
-LOCAL_CFLAGS                  := $(common_flags) -DLOG_TAG=\"qdhwcomposer\"
+LOCAL_CFLAGS                  := $(common_flags) -Os -DLOG_TAG=\"qdhwcomposer\"
 LOCAL_ADDITIONAL_DEPENDENCIES := $(common_deps)
 LOCAL_SRC_FILES               := hwc.cpp          \
                                  hwc_utils.cpp    \
