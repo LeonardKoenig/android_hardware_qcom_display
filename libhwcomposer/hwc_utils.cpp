@@ -45,6 +45,7 @@
 #include "qd_utils.h"
 #include <sys/sysinfo.h>
 #include <dlfcn.h>
+#include <video/msm_hdmi_modes.h>
 
 using namespace qClient;
 using namespace qService;
@@ -92,33 +93,38 @@ bool isValidResolution(hwc_context_t *ctx, uint32_t xres, uint32_t yres)
             (xres < MIN_DISPLAY_XRES || yres < MIN_DISPLAY_YRES));
 }
 
-void changeResolution(hwc_context_t *ctx, int xres_orig, int yres_orig,
-                      int width, int height) {
+static void handleFbScaling(hwc_context_t *ctx, int xresPanel, int yresPanel,
+        int width, int height) {
+    const int dpy = HWC_DISPLAY_PRIMARY;
     //Store original display resolution.
-    ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres_new = xres_orig;
-    ctx->dpyAttr[HWC_DISPLAY_PRIMARY].yres_new = yres_orig;
-    ctx->dpyAttr[HWC_DISPLAY_PRIMARY].customFBSize = false;
+    ctx->dpyAttr[dpy].xresFB = xresPanel;
+    ctx->dpyAttr[dpy].yresFB = yresPanel;
+    ctx->dpyAttr[dpy].fbScaling = false;
     char property[PROPERTY_VALUE_MAX] = {'\0'};
     char *yptr = NULL;
     if (property_get("debug.hwc.fbsize", property, NULL) > 0) {
         yptr = strcasestr(property,"x");
         if(yptr) {
-            int xres_new = atoi(property);
-            int yres_new = atoi(yptr + 1);
-            if (isValidResolution(ctx,xres_new,yres_new) &&
-                xres_new != xres_orig && yres_new != yres_orig) {
-                ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres_new = xres_new;
-                ctx->dpyAttr[HWC_DISPLAY_PRIMARY].yres_new = yres_new;
-                ctx->dpyAttr[HWC_DISPLAY_PRIMARY].customFBSize = true;
+            int xresFB = atoi(property);
+            int yresFB = atoi(yptr + 1);
+            if (isValidResolution(ctx, xresFB, yresFB) &&
+                xresFB != xresPanel && yresFB != yresPanel) {
+                ctx->dpyAttr[dpy].xresFB = xresFB;
+                ctx->dpyAttr[dpy].yresFB = yresFB;
+                ctx->dpyAttr[dpy].fbScaling = true;
 
-                //Caluculate DPI according to changed resolution.
-                float xdpi = ((float)xres_new * 25.4f) / (float)width;
-                float ydpi = ((float)yres_new * 25.4f) / (float)height;
-                ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xdpi = xdpi;
-                ctx->dpyAttr[HWC_DISPLAY_PRIMARY].ydpi = ydpi;
+                //Calculate DPI according to changed resolution.
+                float xdpi = ((float)xresFB * 25.4f) / (float)width;
+                float ydpi = ((float)yresFB * 25.4f) / (float)height;
+                ctx->dpyAttr[dpy].xdpi = xdpi;
+                ctx->dpyAttr[dpy].ydpi = ydpi;
             }
         }
     }
+    ctx->dpyAttr[dpy].fbWidthScaleRatio = (float) ctx->dpyAttr[dpy].xres /
+            (float) ctx->dpyAttr[dpy].xresFB;
+    ctx->dpyAttr[dpy].fbHeightScaleRatio = (float) ctx->dpyAttr[dpy].yres /
+            (float) ctx->dpyAttr[dpy].yresFB;
 }
 
 // Initialize hdmi display attributes based on
@@ -233,8 +239,7 @@ static int openFramebufferDevice(hwc_context_t *ctx)
     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].vsync_period =
             (uint32_t)(1000000000l / fps);
 
-    //To change resolution of primary display
-    changeResolution(ctx, info.xres, info.yres, info.width, info.height);
+    handleFbScaling(ctx, info.xres, info.yres, info.width, info.height);
 
     //Unblank primary on first boot
     if(ioctl(fb_fd, FBIOBLANK,FB_BLANK_UNBLANK) < 0) {
@@ -265,8 +270,25 @@ static void changeDefaultAppBufferCount() {
     }
 }
 
-void initContext(hwc_context_t *ctx)
+int initContext(hwc_context_t *ctx)
 {
+    int error = -1;
+    int compositionType = 0;
+
+    //Right now hwc starts the service but anybody could do it, or it could be
+    //independent process as well.
+    QService::init();
+    sp<IQClient> client = new QClient(ctx);
+    android::sp<qService::IQService> qservice_sp = interface_cast<IQService>(
+            defaultServiceManager()->getService(
+            String16("display.qservice")));
+    if (qservice_sp.get()) {
+      qservice_sp->connect(client);
+    } else {
+      ALOGE("%s: Failed to acquire service pointer", __FUNCTION__);
+      return error;
+    }
+
     overlay::Overlay::initOverlay();
     ctx->mHDMIDisplay = new HDMIDisplay();
     uint32_t priW = 0, priH = 0;
@@ -279,15 +301,24 @@ void initContext(hwc_context_t *ctx)
     if(ctx->mHDMIDisplay->isHDMIPrimaryDisplay()) {
         int connected = ctx->mHDMIDisplay->getConnectedState();
         if(connected == 1) {
-            ctx->mHDMIDisplay->configure();
+            error = ctx->mHDMIDisplay->configure();
+            if (error < 0) {
+                goto OpenFBError;
+            }
             updateDisplayInfo(ctx, HWC_DISPLAY_PRIMARY);
             ctx->dpyAttr[HWC_DISPLAY_PRIMARY].connected = true;
         } else {
-            openFramebufferDevice(ctx);
+            error = openFramebufferDevice(ctx);
+            if(error < 0) {
+                goto OpenFBError;
+            }
             ctx->dpyAttr[HWC_DISPLAY_PRIMARY].connected = false;
         }
     } else {
-        openFramebufferDevice(ctx);
+        error = openFramebufferDevice(ctx);
+        if(error < 0) {
+            goto OpenFBError;
+        }
         ctx->dpyAttr[HWC_DISPLAY_PRIMARY].connected = true;
         // Send the primary resolution to the hdmi display class
         // to be used for MDP scaling functionality
@@ -313,8 +344,8 @@ void initContext(hwc_context_t *ctx)
 
     // Check if the target supports copybit compostion (dyn/mdp) to
     // decide if we need to open the copybit module.
-    int compositionType =
-        qdutils::QCCompositionType::getInstance().getCompositionType();
+    compositionType =
+                qdutils::QCCompositionType::getInstance().getCompositionType();
 
     // Only MDP copybit is used
     if ((compositionType & (qdutils::COMPOSITION_TYPE_DYN |
@@ -351,7 +382,13 @@ void initContext(hwc_context_t *ctx)
         ctx->dpyAttr[i].mActionSafePresent = false;
         ctx->dpyAttr[i].mAsWidthRatio = 0;
         ctx->dpyAttr[i].mAsHeightRatio = 0;
+        ctx->dpyAttr[i].s3dMode = HDMI_S3D_NONE;
+        ctx->dpyAttr[i].s3dModeForced = false;
     }
+
+    //Make sure that the 3D mode is unset at bootup
+    //This makes sure that the state is accurate on framework reboots
+    ctx->mHDMIDisplay->configure3D(HDMI_S3D_NONE);
 
     for (uint32_t i = 0; i < HWC_NUM_DISPLAY_TYPES; i++) {
         ctx->mPrevHwLayerCount[i] = 0;
@@ -364,20 +401,6 @@ void initContext(hwc_context_t *ctx)
     ctx->vstate.fakevsync = false;
     ctx->mExtOrientation = 0;
     ctx->numActiveDisplays = 1;
-
-    //Right now hwc starts the service but anybody could do it, or it could be
-    //independent process as well.
-    QService::init();
-    sp<IQClient> client = new QClient(ctx);
-    android::sp<qService::IQService> qservice_sp = interface_cast<IQService>(
-            defaultServiceManager()->getService(
-            String16("display.qservice")));
-    if (qservice_sp.get()) {
-      qservice_sp->connect(client);
-    } else {
-      ALOGE("%s: Failed to acquire service pointer", __FUNCTION__);
-      return ;
-    }
 
     // Initialize device orientation to its default orientation
     ctx->deviceOrientation = 0;
@@ -420,6 +443,13 @@ void initContext(hwc_context_t *ctx)
     ctx->mHPDEnabled = false;
     ALOGI("Initializing Qualcomm Hardware Composer");
     ALOGI("MDP version: %d", ctx->mMDP.version);
+
+    return 0;
+
+OpenFBError:
+    ALOGE("%s: Fatal Error: FB Open failed!!!", __FUNCTION__);
+    delete ctx->mHDMIDisplay;
+    return error;
 }
 
 void closeContext(hwc_context_t *ctx)
@@ -1008,6 +1038,8 @@ void setListStats(hwc_context_t *ctx,
     ctx->listStats[dpy].refreshRateRequest = ctx->dpyAttr[dpy].refreshRate;
     uint32_t refreshRate = 0;
     qdutils::MDPVersion& mdpHw = qdutils::MDPVersion::getInstance();
+    int s3dFormat = HAL_NO_3D;
+    int s3dLayerCount = 0;
 
     ctx->listStats[dpy].mAIVVideoMode = false;
     resetROI(ctx, dpy);
@@ -1063,6 +1095,14 @@ void setListStats(hwc_context_t *ctx,
                 ctx->listStats[dpy].yuv4k2kIndices[yuv4k2kCount] = (int)i;
                 yuv4k2kCount++;
             }
+
+            // Gets set if one YUV layer is 3D
+            if (displaySupports3D(ctx,dpy)) {
+                s3dFormat = get3DFormat(hnd);
+                if(s3dFormat != HAL_NO_3D)
+                    s3dLayerCount++;
+            }
+
         }
         if(layer->blending == HWC_BLENDING_PREMULT)
             ctx->listStats[dpy].preMultipliedAlpha = true;
@@ -1089,6 +1129,17 @@ void setListStats(hwc_context_t *ctx,
         }
 #endif
     }
+
+    //Set the TV's 3D mode based on format if it was not forced
+    //Only one 3D YUV layer is supported on external
+    //If there is more than one 3D YUV layer, the switch to 3D cannot occur.
+    if( !ctx->dpyAttr[dpy].s3dModeForced && (s3dLayerCount <= 1)) {
+        //XXX: Rapidly going in and out of 3D mode in some cases such
+        // as rotation might cause flickers. The OEMs are recommended to disable
+        // rotation on HDMI globally or in the app that plays 3D video
+        setup3DMode(ctx, dpy, convertS3DFormatToMode(s3dFormat));
+    }
+
     if(ctx->listStats[dpy].yuvCount > 0) {
         if (property_get("hw.cabl.yuv", property, NULL) > 0) {
             if (atoi(property) != 1) {
@@ -2197,6 +2248,113 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     return 0;
 }
 
+int configure3DVideo(hwc_context_t *ctx, hwc_layer_1_t *layer,
+        const int& dpy, eMdpFlags& mdpFlagsL, eZorder& z,
+        const eDest& lDest, const eDest& rDest,
+        Rotator **rot) {
+    private_handle_t *hnd = (private_handle_t *)layer->handle;
+    if(!hnd) {
+        ALOGE("%s: layer handle is NULL", __FUNCTION__);
+        return -1;
+    }
+    //Both pipes are configured to the same mixer
+    eZorder lz = z;
+    eZorder rz = (eZorder)(z + 1);
+
+    MetaData_t *metadata = (MetaData_t *)hnd->base_metadata;
+
+    hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
+    hwc_rect_t dst = layer->displayFrame;
+    int transform = layer->transform;
+    eTransform orient = static_cast<eTransform>(transform);
+    int rotFlags = ROT_FLAGS_NONE;
+    uint32_t format = ovutils::getMdpFormat(hnd->format, hnd->flags);
+    Whf whf(getWidth(hnd), getHeight(hnd), format, (uint32_t)hnd->size);
+
+    int downscale = getRotDownscale(ctx, layer);
+    setMdpFlags(ctx, layer, mdpFlagsL, downscale, transform);
+
+    //XXX: Check if rotation is supported and valid for 3D
+    if((has90Transform(layer) or downscale) and isRotationDoable(ctx, hnd)) {
+        (*rot) = ctx->mRotMgr->getNext();
+        if((*rot) == NULL) return -1;
+        ctx->mLayerRotMap[dpy]->add(layer, *rot);
+        //Configure rotator for pre-rotation
+        if(configRotator(*rot, whf, crop, mdpFlagsL, orient, downscale) < 0) {
+            ALOGE("%s: configRotator failed!", __FUNCTION__);
+            return -1;
+        }
+        updateSource(orient, whf, crop, *rot);
+        rotFlags |= ROT_PREROTATED;
+    }
+
+    eMdpFlags mdpFlagsR = mdpFlagsL;
+
+    hwc_rect_t cropL = crop, dstL = dst;
+    hwc_rect_t cropR = crop, dstR = dst;
+    int hw_w = ctx->dpyAttr[dpy].xres;
+    int hw_h = ctx->dpyAttr[dpy].yres;
+
+    if(get3DFormat(hnd) == HAL_3D_SIDE_BY_SIDE_L_R ||
+            get3DFormat(hnd) == HAL_3D_SIDE_BY_SIDE_R_L) {
+        // Calculate Left rects
+        // XXX: This assumes crop.right/2 is the center point of the video
+        cropL.right = crop.right/2;
+        dstL.left = dst.left/2;
+        dstL.right = dst.right/2;
+
+        // Calculate Right rects
+        cropR.left = crop.right/2;
+        dstR.left = hw_w/2 + dst.left/2;
+        dstR.right = hw_w/2 + dst.right/2;
+    } else if(get3DFormat(hnd) == HAL_3D_TOP_BOTTOM) {
+        // Calculate Left rects
+        cropL.bottom = crop.bottom/2;
+        dstL.top = dst.top/2;
+        dstL.bottom = dst.bottom/2;
+
+        // Calculate Right rects
+        cropR.top = crop.bottom/2;
+        dstR.top = hw_h/2 + dst.top/2;
+        dstR.bottom = hw_h/2 + dst.bottom/2;
+    } else {
+        ALOGE("%s: Unsupported 3D mode ", __FUNCTION__);
+        return -1;
+    }
+
+    //For the mdp, since either we are pre-rotating or MDP does flips
+    orient = OVERLAY_TRANSFORM_0;
+    transform = 0;
+
+    //configure left pipe
+    if(lDest != OV_INVALID) {
+        PipeArgs pargL(mdpFlagsL, whf, lz,
+                       static_cast<eRotFlags>(rotFlags), layer->planeAlpha,
+                       (ovutils::eBlending) getBlending(layer->blending));
+
+        if(configMdp(ctx->mOverlay, pargL, orient,
+                cropL, dstL, metadata, lDest) < 0) {
+            ALOGE("%s: commit failed for left mixer config", __FUNCTION__);
+            return -1;
+        }
+    }
+
+    //configure right pipe
+    if(rDest != OV_INVALID) {
+        PipeArgs pargR(mdpFlagsR, whf, rz,
+                       static_cast<eRotFlags>(rotFlags),
+                       layer->planeAlpha,
+                       (ovutils::eBlending) getBlending(layer->blending));
+        if(configMdp(ctx->mOverlay, pargR, orient,
+                cropR, dstR, metadata, rDest) < 0) {
+            ALOGE("%s: commit failed for right mixer config", __FUNCTION__);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
         const int& dpy, eMdpFlags& mdpFlagsL, eZorder& z,
         const eDest& lDest, const eDest& rDest,
@@ -2793,7 +2951,11 @@ void handle_online(hwc_context_t* ctx, int dpy) {
     // TODO: If HDMI is connected after the display has booted up,
     // and the best configuration is different from the default
     // then we need to deal with this appropriately.
-    ctx->mHDMIDisplay->configure();
+    int error = ctx->mHDMIDisplay->configure();
+    if (error < 0) {
+        ALOGE("Error opening FrameBuffer");
+        return;
+    }
     updateDisplayInfo(ctx, dpy);
     initCompositionResources(ctx, dpy);
     ctx->dpyAttr[dpy].connected = true;
@@ -2815,5 +2977,42 @@ void handle_offline(hwc_context_t* ctx, int dpy) {
     ctx->dpyAttr[dpy].connected = false;
     ctx->dpyAttr[dpy].isActive = false;
 }
+
+int convertS3DFormatToMode(int s3DFormat) {
+    int ret;
+    switch(s3DFormat) {
+    case HAL_3D_SIDE_BY_SIDE_L_R:
+    case HAL_3D_SIDE_BY_SIDE_R_L:
+        ret = HDMI_S3D_SIDE_BY_SIDE;
+        break;
+    case HAL_3D_TOP_BOTTOM:
+        ret = HDMI_S3D_TOP_AND_BOTTOM;
+        break;
+    default:
+        ret = HDMI_S3D_NONE;
+    }
+    return ret;
+}
+
+bool needs3DComposition(hwc_context_t* ctx, int dpy) {
+    return (displaySupports3D(ctx, dpy) && ctx->dpyAttr[dpy].connected &&
+            ctx->dpyAttr[dpy].s3dMode != HDMI_S3D_NONE);
+}
+
+void setup3DMode(hwc_context_t *ctx, int dpy, int s3dMode) {
+    if (ctx->dpyAttr[dpy].s3dMode != s3dMode) {
+        ALOGD("%s: setup 3D mode: %d", __FUNCTION__, s3dMode);
+        if(ctx->mHDMIDisplay->configure3D(s3dMode)) {
+            ctx->dpyAttr[dpy].s3dMode = s3dMode;
+        }
+    }
+}
+
+bool displaySupports3D(hwc_context_t* ctx, int dpy) {
+    return ((dpy == HWC_DISPLAY_EXTERNAL) ||
+            ((dpy == HWC_DISPLAY_PRIMARY) &&
+             ctx->mHDMIDisplay->isHDMIPrimaryDisplay()));
+}
+
 
 };//namespace qhwc

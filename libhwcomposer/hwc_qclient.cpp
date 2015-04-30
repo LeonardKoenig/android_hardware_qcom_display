@@ -35,6 +35,8 @@
 #include <hwc_virtual.h>
 #include <overlay.h>
 #include <display_config.h>
+#include <hdmi.h>
+#include <video/msm_hdmi_modes.h>
 
 #define QCLIENT_DEBUG 0
 
@@ -119,13 +121,8 @@ static void getDisplayAttributes(hwc_context_t* ctx, const Parcel* inParcel,
         Parcel* outParcel) {
     int dpy = inParcel->readInt32();
     outParcel->writeInt32(ctx->dpyAttr[dpy].vsync_period);
-    if (ctx->dpyAttr[dpy].customFBSize) {
-        outParcel->writeInt32(ctx->dpyAttr[dpy].xres_new);
-        outParcel->writeInt32(ctx->dpyAttr[dpy].yres_new);
-    } else {
-        outParcel->writeInt32(ctx->dpyAttr[dpy].xres);
-        outParcel->writeInt32(ctx->dpyAttr[dpy].yres);
-    }
+    outParcel->writeInt32(ctx->dpyAttr[dpy].xres);
+    outParcel->writeInt32(ctx->dpyAttr[dpy].yres);
     outParcel->writeFloat(ctx->dpyAttr[dpy].xdpi);
     outParcel->writeFloat(ctx->dpyAttr[dpy].ydpi);
     //XXX: Need to check what to return for HDMI
@@ -338,6 +335,136 @@ static void toggleScreenUpdate(hwc_context_t* ctx, uint32_t on) {
     }
 }
 
+static void setS3DMode(hwc_context_t* ctx, int mode) {
+    if (ctx->mHDMIDisplay) {
+        if(ctx->mHDMIDisplay->isS3DModeSupported(mode)) {
+            ALOGD("%s: Force S3D mode to %d", __FUNCTION__, mode);
+            Locker::Autolock _sl(ctx->mDrawLock);
+            ctx->dpyAttr[HWC_DISPLAY_EXTERNAL].s3dModeForced = true;
+            setup3DMode(ctx, HWC_DISPLAY_EXTERNAL, mode);
+        } else {
+            ALOGD("%s: mode %d is not supported", __FUNCTION__, mode);
+        }
+    } else {
+        ALOGE("%s: No HDMI Display detected", __FUNCTION__);
+    }
+}
+
+static status_t setActiveConfig(hwc_context_t* ctx, const Parcel *inParcel,
+        Parcel *outParcel) {
+    uint32_t index = inParcel->readInt32();
+    int dpy = inParcel->readInt32();
+    //Currently only primary supported
+    if(dpy > HWC_DISPLAY_PRIMARY) {
+        return BAD_VALUE;
+    }
+
+    Configs *configs = Configs::getInstance();
+    if(configs == NULL) {
+        ALOGE("%s(): Unable to acquire a Configs instance", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+
+    if(configs->getActiveConfig() == index) {
+        ALOGI("%s(): Config %u is already set", __FUNCTION__, index);
+        return ALREADY_EXISTS;
+    }
+
+    ctx->mDrawLock.lock();
+    //Updates the necessary sysfs nodes and reads split info again which is
+    //needed to reinitialize composition resources.
+    if(configs->setActiveConfig(index) == false) {
+        ALOGE("%s(): Failed to set config %u", __FUNCTION__, index);
+        ctx->mDrawLock.unlock();
+        return UNKNOWN_ERROR;
+    }
+
+    qdutils::DisplayAttributes attr = configs->getAttributes(index);
+
+    ctx->dpyAttr[dpy].xres = attr.xres;
+    ctx->dpyAttr[dpy].yres = attr.yres;
+
+    ctx->dpyAttr[dpy].fbScaling = ((ctx->dpyAttr[dpy].xres !=
+            ctx->dpyAttr[dpy].xresFB) || (ctx->dpyAttr[dpy].yres !=
+            ctx->dpyAttr[dpy].yresFB));
+
+    destroyCompositionResources(ctx, dpy);
+    initCompositionResources(ctx, dpy);
+    ctx->dpyAttr[dpy].configSwitched = true;
+    ctx->mDrawLock.unlock();
+    ctx->proc->invalidate(ctx->proc);
+    return NO_ERROR;
+}
+
+static status_t getActiveConfig(hwc_context_t* ctx, const Parcel *inParcel,
+        Parcel *outParcel) {
+    Locker::Autolock _sl(ctx->mDrawLock);
+    int dpy = inParcel->readInt32();
+    //Currently only primary supported
+    if(dpy > HWC_DISPLAY_PRIMARY) {
+        return BAD_VALUE;
+    }
+
+    Configs *configs = Configs::getInstance();
+    if(configs == NULL) {
+        ALOGE("%s(): Unable to acquire a Configs instance", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+
+    outParcel->writeInt32(configs->getActiveConfig());
+    return NO_ERROR;
+}
+
+static status_t getConfigCount(hwc_context_t* ctx, const Parcel *inParcel,
+        Parcel *outParcel) {
+    Locker::Autolock _sl(ctx->mDrawLock);
+    int dpy = inParcel->readInt32();
+    //Currently only primary supported
+    if(dpy > HWC_DISPLAY_PRIMARY) {
+        return BAD_VALUE;
+    }
+
+    Configs *configs = Configs::getInstance();
+    if(configs == NULL) {
+        ALOGE("%s(): Unable to acquire a Configs instance", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+
+    outParcel->writeInt32(configs->getConfigCount());
+    return NO_ERROR;
+}
+
+static status_t getDisplayAttributesForConfig(hwc_context_t* ctx,
+        const Parcel *inParcel, Parcel *outParcel) {
+    Locker::Autolock _sl(ctx->mDrawLock);
+    uint32_t index = inParcel->readInt32();
+    int dpy = inParcel->readInt32();
+    //Currently only primary supported
+    if(dpy > HWC_DISPLAY_PRIMARY) {
+        return BAD_VALUE;
+    }
+
+    Configs *configs = Configs::getInstance();
+    if(configs == NULL) {
+        ALOGE("%s(): Unable to acquire a Configs instance", __FUNCTION__);
+        return INVALID_OPERATION;
+    }
+
+    //xres, yres are used from the Config class, we assume for now that the
+    //other params are the same. This might change in the future.
+    outParcel->writeInt32(ctx->dpyAttr[dpy].vsync_period);
+
+    qdutils::DisplayAttributes attr = configs->getAttributes(index);
+    outParcel->writeInt32(attr.xres);
+    outParcel->writeInt32(attr.yres);
+
+    outParcel->writeFloat(ctx->dpyAttr[dpy].xdpi);
+    outParcel->writeFloat(ctx->dpyAttr[dpy].ydpi);
+    outParcel->writeInt32(ctx->mMDP.panel);
+
+    return NO_ERROR;
+}
+
 status_t QClient::notifyCallback(uint32_t command, const Parcel* inParcel,
         Parcel* outParcel) {
     status_t ret = NO_ERROR;
@@ -397,6 +524,22 @@ status_t QClient::notifyCallback(uint32_t command, const Parcel* inParcel,
             break;
         case IQService::TOGGLE_SCREEN_UPDATE:
             toggleScreenUpdate(mHwcContext, inParcel->readInt32());
+            break;
+        case IQService::SET_S3D_MODE:
+            setS3DMode(mHwcContext, inParcel->readInt32());
+            break;
+        case IQService::SET_ACTIVE_CONFIG:
+            ret = setActiveConfig(mHwcContext, inParcel, outParcel);
+            break;
+        case IQService::GET_ACTIVE_CONFIG:
+            ret = getActiveConfig(mHwcContext, inParcel, outParcel);
+            break;
+        case IQService::GET_CONFIG_COUNT:
+            ret = getConfigCount(mHwcContext, inParcel, outParcel);
+            break;
+        case IQService::GET_DISPLAY_ATTRIBUTES_FOR_CONFIG:
+            ret = getDisplayAttributesForConfig(mHwcContext, inParcel,
+                    outParcel);
             break;
         default:
             ret = NO_ERROR;

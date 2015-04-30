@@ -57,6 +57,8 @@ int (*MDPComp::sPerfLockAcquire)(int, int, int*, int) = NULL;
 int (*MDPComp::sPerfLockRelease)(int value) = NULL;
 int MDPComp::sPerfHintWindow = -1;
 
+enum AllocOrder { FORMAT_YUV, FORMAT_RGB, FORMAT_MAX };
+
 MDPComp* MDPComp::getObject(hwc_context_t *ctx, const int& dpy) {
     if(qdutils::MDPVersion::getInstance().isSrcSplit()) {
         sSrcSplitEnabled = true;
@@ -434,6 +436,13 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
     if(mdpHw.hasMinCropWidthLimitation() and (crop_w < 5 or crop_h < 5))
         return false;
 
+    /* crop_w and crop_h should be even for yuv layer, so fallback to GPU for
+     * those cases
+     */
+    if(isYuvBuffer(hnd) && (crop_w < 2 || crop_h < 2)) {
+        return false;
+    }
+
     if((w_scale > 1.0f) || (h_scale > 1.0f)) {
         const uint32_t maxMDPDownscale = mdpHw.getMaxMDPDownscale();
         const float w_dscale = w_scale;
@@ -497,6 +506,14 @@ bool MDPComp::isFrameDoable(hwc_context_t *ctx) {
         //1 Padding round to shift pipes across mixers
         ALOGD_IF(isDebug(),"%s: MDP Comp. video transition padding round",
                 __FUNCTION__);
+        ret = false;
+    } else if((qdutils::MDPVersion::getInstance().is8x26() ||
+               qdutils::MDPVersion::getInstance().is8x16() ||
+               qdutils::MDPVersion::getInstance().is8x39()) &&
+              !mDpy && isSecondaryAnimating(ctx) &&
+              isYuvPresent(ctx,HWC_DISPLAY_VIRTUAL)) {
+        ALOGD_IF(isDebug(),"%s: Display animation in progress",
+                 __FUNCTION__);
         ret = false;
     } else if(qdutils::MDPVersion::getInstance().getTotalPipes() < 8) {
        /* TODO: freeing up all the resources only for the targets having total
@@ -791,6 +808,14 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
         return false;
     }
 
+    if(!mDpy && isSecondaryAnimating(ctx) &&
+       (isYuvPresent(ctx,HWC_DISPLAY_EXTERNAL) ||
+       isYuvPresent(ctx,HWC_DISPLAY_VIRTUAL)) ) {
+        ALOGD_IF(isDebug(),"%s: Display animation in progress",
+                 __FUNCTION__);
+        return false;
+    }
+
     // if secondary is configuring or Padding round, fall back to video only
     // composition and release all assigned non VIG pipes from primary.
     if(isSecondaryConfiguring(ctx)) {
@@ -802,6 +827,10 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
                  __FUNCTION__,mDpy);
         return false;
     }
+
+    // No MDP composition for 3D
+    if(needs3DComposition(ctx, mDpy))
+        return false;
 
     // check for action safe flag and MDP scaling mode which requires scaling.
     if(ctx->dpyAttr[mDpy].mActionSafePresent
@@ -1337,7 +1366,7 @@ bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
     if(mCurrentFrame.fbCount)
         mCurrentFrame.fbZ = mCurrentFrame.mdpCount;
 
-    if(sEnableYUVsplit){
+    if(sEnableYUVsplit || needs3DComposition(ctx, mDpy)){
         adjustForSourceSplit(ctx, list);
     }
 
@@ -1366,6 +1395,10 @@ bool MDPComp::tryMDPOnlyLayers(hwc_context_t *ctx,
             __FUNCTION__, mDpy);
         return false;
     }
+
+    // No MDP composition for 3D
+    if(needs3DComposition(ctx,mDpy))
+        return false;
 
     const bool secureOnly = true;
     return mdpOnlyLayersComp(ctx, list, not secureOnly) or
@@ -1828,6 +1861,9 @@ bool MDPComp::postHeuristicsHandling(hwc_context_t *ctx,
                 }
                 continue;
             }
+            if(needs3DComposition(ctx,mDpy) && get3DFormat(hnd) != HAL_NO_3D) {
+                mdpNextZOrder++;
+            }
             if(configure(ctx, layer, mCurrentFrame.mdpToLayer[mdpIndex]) != 0 ){
                 ALOGD_IF(isDebug(), "%s: Failed to configure overlay for \
                         layer %d",__FUNCTION__, index);
@@ -1986,9 +2022,6 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
             }
         }
     }
-    // reset PTOR
-    if(!mDpy)
-        memset(&(ctx->mPtorInfo), 0, sizeof(ctx->mPtorInfo));
 
     //reset old data
     mCurrentFrame.reset(numLayers);
@@ -2080,7 +2113,7 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     return ret;
 }
 
-bool MDPComp::allocSplitVGPipesfor4k2k(hwc_context_t *ctx, int index) {
+bool MDPComp::allocSplitVGPipes(hwc_context_t *ctx, int index) {
 
     bool bRet = true;
     int mdpIndex = mCurrentFrame.layerToMDP[index];
@@ -2176,39 +2209,48 @@ int MDPCompNonSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
 bool MDPCompNonSplit::allocLayerPipes(hwc_context_t *ctx,
         hwc_display_contents_1_t* list) {
-    for(int index = 0; index < mCurrentFrame.layerCount; index++) {
+    for(uint32_t formatType = FORMAT_YUV; formatType < FORMAT_MAX;
+            formatType++) {
+        for(int index = 0; index < mCurrentFrame.layerCount; index++) {
+            if(mCurrentFrame.isFBComposed[index]) continue;
 
-        if(mCurrentFrame.isFBComposed[index]) continue;
-
-        hwc_layer_1_t* layer = &list->hwLayers[index];
-        private_handle_t *hnd = (private_handle_t *)layer->handle;
-        if(isYUVSplitNeeded(hnd) && sEnableYUVsplit){
-            if(allocSplitVGPipesfor4k2k(ctx, index)){
+            hwc_layer_1_t* layer = &list->hwLayers[index];
+            private_handle_t *hnd = (private_handle_t *)layer->handle;
+            if(formatType == FORMAT_YUV && !isYuvBuffer(hnd))
                 continue;
+            if(formatType == FORMAT_RGB && isYuvBuffer(hnd))
+                continue;
+
+            if(isYUVSplitNeeded(hnd) && sEnableYUVsplit){
+                if(allocSplitVGPipes(ctx, index)){
+                    continue;
+                }
             }
-        }
 
-        int mdpIndex = mCurrentFrame.layerToMDP[index];
-        PipeLayerPair& info = mCurrentFrame.mdpToLayer[mdpIndex];
-        info.pipeInfo = new MdpPipeInfoNonSplit;
-        info.rot = NULL;
-        MdpPipeInfoNonSplit& pipe_info = *(MdpPipeInfoNonSplit*)info.pipeInfo;
+            int mdpIndex = mCurrentFrame.layerToMDP[index];
+            PipeLayerPair& info = mCurrentFrame.mdpToLayer[mdpIndex];
+            info.pipeInfo = new MdpPipeInfoNonSplit;
+            info.rot = NULL;
+            MdpPipeInfoNonSplit& pipe_info =
+                    *(MdpPipeInfoNonSplit*)info.pipeInfo;
 
-        Overlay::PipeSpecs pipeSpecs;
-        pipeSpecs.formatClass = isYuvBuffer(hnd) ?
-                Overlay::FORMAT_YUV : Overlay::FORMAT_RGB;
-        pipeSpecs.needsScaling = qhwc::needsScaling(layer) or
-                (qdutils::MDPVersion::getInstance().is8x26() and
-                ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres > 1024);
-        pipeSpecs.dpy = mDpy;
-        pipeSpecs.fb = false;
-        pipeSpecs.numActiveDisplays = ctx->numActiveDisplays;
+            Overlay::PipeSpecs pipeSpecs;
+            pipeSpecs.formatClass = isYuvBuffer(hnd) ?
+                    Overlay::FORMAT_YUV : Overlay::FORMAT_RGB;
+            pipeSpecs.needsScaling = qhwc::needsScaling(layer) or
+                    (qdutils::MDPVersion::getInstance().is8x26() and
+                     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres > 1024);
+            pipeSpecs.dpy = mDpy;
+            pipeSpecs.fb = false;
+            pipeSpecs.numActiveDisplays = ctx->numActiveDisplays;
 
-        pipe_info.index = ctx->mOverlay->getPipe(pipeSpecs);
+            pipe_info.index = ctx->mOverlay->getPipe(pipeSpecs);
 
-        if(pipe_info.index == ovutils::OV_INVALID) {
-            ALOGD_IF(isDebug(), "%s: Unable to get pipe", __FUNCTION__);
-            return false;
+            if(pipe_info.index == ovutils::OV_INVALID) {
+                ALOGD_IF(isDebug(), "%s: Unable to get pipe for layer %d of "\
+                        "format type %d", __FUNCTION__, index, formatType);
+                return false;
+            }
         }
     }
     return true;
@@ -2360,7 +2402,9 @@ void MDPCompSplit::adjustForSourceSplit(hwc_context_t *ctx,
                 mdpNextZOrder++;
                 hwc_layer_1_t* layer = &list->hwLayers[index];
                 private_handle_t *hnd = (private_handle_t *)layer->handle;
-                if(isYUVSplitNeeded(hnd)) {
+                if(isYUVSplitNeeded(hnd) ||
+                        (needs3DComposition(ctx,mDpy) &&
+                         get3DFormat(hnd) != HAL_NO_3D)) {
                     hwc_rect_t dst = layer->displayFrame;
                     if((dst.left > lSplit) || (dst.right < lSplit)) {
                         mCurrentFrame.mdpCount += 1;
@@ -2413,31 +2457,43 @@ bool MDPCompSplit::acquireMDPPipes(hwc_context_t *ctx, hwc_layer_1_t* layer,
 
 bool MDPCompSplit::allocLayerPipes(hwc_context_t *ctx,
         hwc_display_contents_1_t* list) {
-    for(int index = 0 ; index < mCurrentFrame.layerCount; index++) {
+    for(uint32_t formatType = FORMAT_YUV; formatType < FORMAT_MAX;
+            formatType++) {
+        for(int index = 0 ; index < mCurrentFrame.layerCount; index++) {
+            if(mCurrentFrame.isFBComposed[index]) continue;
 
-        if(mCurrentFrame.isFBComposed[index]) continue;
+            hwc_layer_1_t* layer = &list->hwLayers[index];
+            private_handle_t *hnd = (private_handle_t *)layer->handle;
+            if(formatType == FORMAT_YUV && !isYuvBuffer(hnd))
+                continue;
+            if(formatType == FORMAT_RGB && isYuvBuffer(hnd))
+                continue;
 
-        hwc_layer_1_t* layer = &list->hwLayers[index];
-        private_handle_t *hnd = (private_handle_t *)layer->handle;
-        hwc_rect_t dst = layer->displayFrame;
-        const int lSplit = getLeftSplit(ctx, mDpy);
-        if(isYUVSplitNeeded(hnd) && sEnableYUVsplit){
-            if((dst.left > lSplit)||(dst.right < lSplit)){
-                if(allocSplitVGPipesfor4k2k(ctx, index)){
-                    continue;
+            hwc_rect_t dst = layer->displayFrame;
+            const int lSplit = getLeftSplit(ctx, mDpy);
+            if(isYUVSplitNeeded(hnd) && sEnableYUVsplit){
+                if((dst.left > lSplit)||(dst.right < lSplit)){
+                    if(allocSplitVGPipes(ctx, index)){
+                        continue;
+                    }
                 }
             }
-        }
-        int mdpIndex = mCurrentFrame.layerToMDP[index];
-        PipeLayerPair& info = mCurrentFrame.mdpToLayer[mdpIndex];
-        info.pipeInfo = new MdpPipeInfoSplit;
-        info.rot = NULL;
-        MdpPipeInfoSplit& pipe_info = *(MdpPipeInfoSplit*)info.pipeInfo;
+            //XXX: Check for forced 2D composition
+            if(needs3DComposition(ctx, mDpy) && get3DFormat(hnd) != HAL_NO_3D)
+                if(allocSplitVGPipes(ctx,index))
+                    continue;
 
-        if(!acquireMDPPipes(ctx, layer, pipe_info)) {
-            ALOGD_IF(isDebug(), "%s: Unable to get pipe for type",
-                    __FUNCTION__);
-            return false;
+            int mdpIndex = mCurrentFrame.layerToMDP[index];
+            PipeLayerPair& info = mCurrentFrame.mdpToLayer[mdpIndex];
+            info.pipeInfo = new MdpPipeInfoSplit;
+            info.rot = NULL;
+            MdpPipeInfoSplit& pipe_info = *(MdpPipeInfoSplit*)info.pipeInfo;
+
+            if(!acquireMDPPipes(ctx, layer, pipe_info)) {
+                ALOGD_IF(isDebug(), "%s: Unable to get pipe for layer %d of "\
+                        "format type %d", __FUNCTION__, index, formatType);
+                return false;
+            }
         }
     }
     return true;
@@ -2490,7 +2546,9 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     }
 
     // Set the Handle timeout to true for MDP or MIXED composition.
-    if(sIdleInvalidator && !sIdleFallBack && mCurrentFrame.mdpCount) {
+    if(sIdleInvalidator && !sIdleFallBack && mCurrentFrame.mdpCount &&
+            !(needs3DComposition(ctx, HWC_DISPLAY_PRIMARY) ||
+                needs3DComposition(ctx, HWC_DISPLAY_EXTERNAL))) {
         sHandleTimeout = true;
     }
 
@@ -2515,7 +2573,8 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
         int mdpIndex = mCurrentFrame.layerToMDP[i];
 
-        if(isYUVSplitNeeded(hnd) && sEnableYUVsplit)
+        if((isYUVSplitNeeded(hnd) && sEnableYUVsplit) ||
+                (needs3DComposition(ctx, mDpy) && get3DFormat(hnd) != HAL_NO_3D))
         {
             MdpYUVPipeInfo& pipe_info =
                 *(MdpYUVPipeInfo*)mCurrentFrame.mdpToLayer[mdpIndex].pipeInfo;
@@ -2823,6 +2882,7 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
     int rotFlags = ROT_FLAGS_NONE;
     uint32_t format = ovutils::getMdpFormat(hnd->format, hnd->flags);
     Whf whf(getWidth(hnd), getHeight(hnd), format, hnd->size);
+    eMdpFlags mdpFlags = ovutils::OV_MDP_FLAGS_NONE;
 
     ALOGD_IF(isDebug(),"%s: configuring: layer: %p z_order: %d dest_pipeL: %d"
              "dest_pipeR: %d",__FUNCTION__, layer, z, lDest, rDest);
@@ -2836,6 +2896,12 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
          *            the ROI needs to find the no. of pipes the layer needs.
          */
         trimAgainstROI(ctx, crop, dst);
+    }
+
+    if(needs3DComposition(ctx, mDpy) &&
+            get3DFormat(hnd) != HAL_NO_3D){
+        return configure3DVideo(ctx, layer, mDpy, mdpFlags, z, lDest,
+                rDest, &PipeLayerPair.rot);
     }
 
     // Handle R/B swap
@@ -2854,7 +2920,6 @@ int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
     calcExtDisplayPosition(ctx, hnd, mDpy, crop, dst, transform, orient);
 
     int downscale = getRotDownscale(ctx, layer);
-    eMdpFlags mdpFlags = ovutils::OV_MDP_FLAGS_NONE;
     setMdpFlags(ctx, layer, mdpFlags, downscale, transform);
 
     if(lDest != OV_INVALID && rDest != OV_INVALID) {
@@ -3041,9 +3106,7 @@ void MDPComp::setPerfHint(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
         int perfHint = 0x4501; // 45-display layer hint, 01-Enable
         sPerfLockHandle = sPerfLockAcquire(0 /*handle*/, 0/*duration*/,
                                     &perfHint, sizeof(perfHint)/sizeof(int));
-        if(sPerfLockHandle < 0) {
-            ALOGE("Perf Lock Acquire Failed");
-        } else {
+        if(sPerfLockHandle > 0) {
             perflockFlag = 1;
         }
     }
